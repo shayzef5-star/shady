@@ -4,13 +4,17 @@ const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Раздаем статические файлы из папки public
 app.use(express.static('public'));
 
 // Настройка загрузки файлов
@@ -23,7 +27,6 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 
 // Создаем папку для загрузок
-const fs = require('fs');
 if (!fs.existsSync('./public/uploads')) {
     fs.mkdirSync('./public/uploads', { recursive: true });
 }
@@ -36,7 +39,6 @@ const db = new sqlite3.Database('./database.sqlite', (err) => {
 
 // Создание таблиц
 db.serialize(() => {
-    // Пользователи
     db.run(`CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT,
@@ -48,14 +50,12 @@ db.serialize(() => {
         points INTEGER DEFAULT 0
     )`);
 
-    // Категории
     db.run(`CREATE TABLE IF NOT EXISTS categories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT,
         color TEXT DEFAULT '#3b82f6'
     )`);
 
-    // Активности
     db.run(`CREATE TABLE IF NOT EXISTS activities (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT,
@@ -71,7 +71,6 @@ db.serialize(() => {
         FOREIGN KEY(organizer_id) REFERENCES users(id)
     )`);
 
-    // Участие
     db.run(`CREATE TABLE IF NOT EXISTS participations (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -84,7 +83,6 @@ db.serialize(() => {
         FOREIGN KEY(activity_id) REFERENCES activities(id)
     )`);
 
-    // Уведомления
     db.run(`CREATE TABLE IF NOT EXISTS notifications (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -98,7 +96,7 @@ db.serialize(() => {
 
     // Добавляем тестовые категории
     db.get("SELECT COUNT(*) as count FROM categories", (err, row) => {
-        if (row.count === 0) {
+        if (row && row.count === 0) {
             const categories = [
                 ['Спорт', '#ef4444'],
                 ['Творчество', '#10b981'],
@@ -114,7 +112,7 @@ db.serialize(() => {
 
     // Добавляем тестового организатора
     db.get("SELECT COUNT(*) as count FROM users WHERE role = 'organizer'", (err, row) => {
-        if (row.count === 0) {
+        if (row && row.count === 0) {
             const hashedPassword = bcrypt.hashSync('admin123', 10);
             db.run("INSERT INTO users (name, email, password, role, school) VALUES (?, ?, ?, ?, ?)",
                 ['Администратор', 'admin@school.ru', hashedPassword, 'organizer', 'Школа №1']
@@ -173,7 +171,24 @@ app.get('/api/activities/:id', (req, res) => {
     });
 });
 
-// Создать активность (только организатор)
+// Получить список участников активности
+app.get('/api/activities/:id/participants', (req, res) => {
+    db.all(`
+        SELECT u.name, u.class, p.status, p.materials, p.awarded_points
+        FROM participations p
+        JOIN users u ON p.user_id = u.id
+        WHERE p.activity_id = ?
+        ORDER BY p.status DESC, u.name ASC
+    `, [req.params.id], (err, rows) => {
+        if (err) {
+            res.status(400).json({ error: err.message });
+        } else {
+            res.json(rows || []);
+        }
+    });
+});
+
+// Создать активность
 app.post('/api/activities', (req, res) => {
     const { title, description, category_id, date, deadline, points, max_participants, requirements, organizer_id } = req.body;
     db.run(`INSERT INTO activities (title, description, category_id, date, deadline, points, max_participants, requirements, organizer_id)
@@ -186,15 +201,28 @@ app.post('/api/activities', (req, res) => {
     );
 });
 
+// Удалить активность
+app.delete('/api/activities/:id', (req, res) => {
+    const activityId = req.params.id;
+    
+    db.run("DELETE FROM participations WHERE activity_id = ?", [activityId], function(err) {
+        db.run("DELETE FROM activities WHERE id = ?", [activityId], function(err) {
+            if (err) {
+                return res.status(400).json({ error: err.message });
+            }
+            res.json({ message: 'Активность успешно удалена' });
+        });
+    });
+});
+
 // Зарегистрироваться на активность
 app.post('/api/activities/:id/register', (req, res) => {
     const { user_id } = req.body;
     const activity_id = req.params.id;
     
-    // Проверяем лимит
     db.get("SELECT max_participants FROM activities WHERE id = ?", [activity_id], (err, activity) => {
         db.get("SELECT COUNT(*) as count FROM participations WHERE activity_id = ?", [activity_id], (err, part) => {
-            if (activity.max_participants > 0 && part.count >= activity.max_participants) {
+            if (activity && activity.max_participants > 0 && part.count >= activity.max_participants) {
                 return res.status(400).json({ error: 'Нет свободных мест' });
             }
             
@@ -254,16 +282,15 @@ app.get('/api/categories', (req, res) => {
     });
 });
 
-// Проверка материалов (организатор)
+// Проверка материалов
 app.post('/api/review/:participation_id', (req, res) => {
     const { awarded_points, comment, status } = req.body;
     db.run(`UPDATE participations SET awarded_points = ?, comment = ?, status = ? WHERE id = ?`,
         [awarded_points, comment, status, req.params.participation_id], function(err) {
             if (err) return res.status(400).json({ error: err.message });
             
-            // Обновляем баллы пользователя
             db.get("SELECT user_id FROM participations WHERE id = ?", [req.params.participation_id], (err, part) => {
-                if (awarded_points) {
+                if (awarded_points && part) {
                     db.run("UPDATE users SET points = points + ? WHERE id = ?", [awarded_points, part.user_id]);
                 }
             });
@@ -278,43 +305,14 @@ app.get('/api/notifications/:user_id', (req, res) => {
     });
 });
 
+// ============= ОТДАЧА ФРОНТЕНДА =============
+// Все GET запросы, которые не начинаются с /api, отдаем index.html
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
 // Запуск сервера
-// Получить список участников активности
-app.get('/api/activities/:id/participants', (req, res) => {
-    db.all(`
-        SELECT u.name, u.class, p.status, p.materials, p.awarded_points
-        FROM participations p
-        JOIN users u ON p.user_id = u.id
-        WHERE p.activity_id = ?
-        ORDER BY p.status DESC, u.name ASC
-    `, [req.params.id], (err, rows) => {
-        if (err) {
-            res.status(400).json({ error: err.message });
-        } else {
-            res.json(rows || []);
-        }
-    });
-});
-// Удалить активность (только для организатора)
-app.delete('/api/activities/:id', (req, res) => {
-    const activityId = req.params.id;
-    
-    // Сначала удаляем все связанные участия (participations)
-    db.run("DELETE FROM participations WHERE activity_id = ?", [activityId], function(err) {
-        if (err) {
-            console.error('Ошибка при удалении участий:', err);
-            // Продолжаем, даже если ошибка
-        }
-        
-        // Затем удаляем саму активность
-        db.run("DELETE FROM activities WHERE id = ?", [activityId], function(err) {
-            if (err) {
-                return res.status(400).json({ error: err.message });
-            }
-            res.json({ message: 'Активность успешно удалена' });
-        });
-    });
-});
 app.listen(PORT, () => {
     console.log(`🚀 Сервер запущен на http://localhost:${PORT}`);
+    console.log(`📱 Открыть: http://localhost:${PORT}`);
 });
